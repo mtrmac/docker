@@ -200,3 +200,175 @@ func (s *DockerTrustSuite) TestTrustedOfflinePull(c *check.C) {
 	c.Assert(err, check.IsNil, check.Commentf(out))
 	c.Assert(string(out), checker.Contains, "Tagging", check.Commentf(out))
 }
+
+func (s *DockerDaemonTrustSuite) TestDaemonTrustedPull(c *check.C) {
+	repoName := s.dts.setupTrustedImage(c, "daemon-trusted-pull")
+
+	if err := s.startDaemon(); err != nil {
+		c.Fatal(err)
+	}
+
+	// Try pull
+	out, err := s.d.Cmd("pull", repoName)
+	c.Assert(err, check.IsNil, check.Commentf(out))
+	c.Assert(string(out), checker.Contains, "Tagging", check.Commentf(out))
+
+	s.d.CmdOrAssert("rmi", repoName)
+}
+
+func (s *DockerDaemonTrustSuite) TestDaemonUntrustedPull(c *check.C) {
+	repoName := fmt.Sprintf("%v/dockercli/daemon-trusted:latest", privateRegistryURL)
+	// tag the image and upload it to the private registry
+	dockerCmd(c, "tag", "busybox", repoName)
+	dockerCmd(c, "push", repoName)
+	dockerCmd(c, "rmi", repoName)
+
+	if err := s.startDaemon(); err != nil {
+		c.Fatal(err)
+	}
+
+	// Try trusted pull on untrusted tag
+	out, err := s.d.Cmd("pull", repoName)
+	c.Assert(err, check.NotNil, check.Commentf(out))
+	c.Assert(string(out), checker.Contains, "no trust data available", check.Commentf(out))
+}
+
+func (s *DockerDaemonTrustSuite) TestDaemonPullWhenCertExpired(c *check.C) {
+	c.Skip("Currently changes system time, causing instability")
+	repoName := s.dts.setupTrustedImage(c, "daemon-trusted-cert-expired")
+
+	// Certificates have 10 years of expiration
+	elevenYearsFromNow := time.Now().Add(time.Hour * 24 * 365 * 11)
+
+	if err := s.startDaemon(); err != nil {
+		c.Fatal(err)
+	}
+
+	runAtDifferentDate(elevenYearsFromNow, func() {
+		// Try pull
+		out, err := s.d.Cmd("pull", repoName)
+		c.Assert(err, check.NotNil, check.Commentf(out))
+		c.Assert(string(out), checker.Contains, "validate the path to a trusted root", check.Commentf(out))
+	})
+
+	if err := s.restartDaemon("--untrusted-pull=true"); err != nil {
+		c.Fatal(err)
+	}
+
+	runAtDifferentDate(elevenYearsFromNow, func() {
+		// Try pull
+		out, err := s.d.Cmd("pull", repoName)
+		c.Assert(err, check.IsNil, check.Commentf(out))
+		c.Assert(string(out), checker.Contains, "Status: Downloaded", check.Commentf(out))
+	})
+}
+
+func (s *DockerDaemonTrustSuite) TestDaemonTrustedPullFromBadTrustServer(c *check.C) {
+	repoName := fmt.Sprintf("%v/dockerclievilpull/daemon-trusted:latest", privateRegistryURL)
+	evilLocalConfigDir, err := ioutil.TempDir("", "evil-local-config-dir")
+	if err != nil {
+		c.Fatalf("Failed to create local temp dir")
+	}
+
+	// tag the image and upload it to the private registry
+	dockerCmd(c, "tag", "busybox", repoName)
+
+	pushCmd := exec.Command(dockerBinary, "push", repoName)
+	s.dts.trustedCmd(pushCmd)
+	out, _, err := runCommandWithOutput(pushCmd)
+	c.Assert(err, check.IsNil, check.Commentf(out))
+	c.Assert(string(out), checker.Contains, "Signing and pushing trust metadata", check.Commentf(out))
+
+	dockerCmd(c, "rmi", repoName)
+
+	if err := s.startDaemon(); err != nil {
+		c.Fatal(err)
+	}
+
+	// Try pull
+	out, err = s.d.Cmd("pull", repoName)
+	c.Assert(err, check.IsNil, check.Commentf(out))
+	c.Assert(string(out), checker.Contains, "Tagging", check.Commentf(out))
+
+	s.d.CmdOrAssert("rmi", repoName)
+
+	// Kill the notary server, start a new "evil" one.
+	s.dts.not.Close()
+	s.dts.not, err = newTestNotary(c)
+	c.Assert(err, check.IsNil, check.Commentf("Restarting notary server failed."))
+
+	// In order to make an evil server, lets re-init a client (with a different trust dir) and push new data.
+	// tag an image and upload it to the private registry
+	dockerCmd(c, "--config", evilLocalConfigDir, "tag", "busybox", repoName)
+
+	// Push up to the new server
+	pushCmd = exec.Command(dockerBinary, "--config", evilLocalConfigDir, "push", repoName)
+	s.dts.trustedCmd(pushCmd)
+	out, _, err = runCommandWithOutput(pushCmd)
+	c.Assert(err, check.IsNil, check.Commentf(out))
+	c.Assert(string(out), checker.Contains, "Signing and pushing trust metadata", check.Commentf(out))
+
+	// Now, try pulling with the original client from this new trust server. This should fail.
+	out, err = s.d.Cmd("pull", repoName)
+	c.Assert(err, check.NotNil, check.Commentf(out))
+	c.Assert(string(out), checker.Contains, "failed to validate data with current trusted certificates", check.Commentf(out))
+}
+
+func (s *DockerDaemonTrustSuite) TestDaemonTrustedPullWithExpiredSnapshot(c *check.C) {
+	c.Skip("Currently changes system time, causing instability")
+	repoName := fmt.Sprintf("%v/dockercliexpiredtimestamppull/daemon-trusted:latest", privateRegistryURL)
+	// tag the image and upload it to the private registry
+	dockerCmd(c, "tag", "busybox", repoName)
+
+	// Push with default passphrases
+	pushCmd := exec.Command(dockerBinary, "push", repoName)
+	s.dts.trustedCmd(pushCmd)
+	out, _, err := runCommandWithOutput(pushCmd)
+	c.Assert(err, check.IsNil, check.Commentf(out))
+	c.Assert(string(out), checker.Contains, "Signing and pushing trust metadata", check.Commentf(out))
+
+	dockerCmd(c, "rmi", repoName)
+
+	// Snapshots last for three years. This should be expired
+	fourYearsLater := time.Now().Add(time.Hour * 24 * 365 * 4)
+
+	if err := s.startDaemon(); err != nil {
+		c.Fatal(err)
+	}
+
+	runAtDifferentDate(fourYearsLater, func() {
+		// Try pull
+		out, err = s.d.Cmd("pull", repoName)
+		c.Assert(err, check.NotNil, check.Commentf(out))
+		c.Assert(string(out), checker.Contains, "repository out-of-date", check.Commentf(out))
+	})
+}
+
+func (s *DockerDaemonTrustSuite) TestDaemonTrustedOfflinePull(c *check.C) {
+	repoName := s.dts.setupTrustedImage(c, "daemon-trusted-offline-pull")
+
+	if err := s.startDaemonWithServer("https://invalidnotaryserver"); err != nil {
+		c.Fatal(err)
+	}
+	out, err := s.d.Cmd("pull", repoName)
+	c.Assert(err, check.NotNil, check.Commentf(out))
+	c.Assert(string(out), checker.Contains, "no trust data available", check.Commentf(out))
+
+	// Do valid trusted pull to warm cache
+	if err := s.restartDaemon(); err != nil {
+		c.Fatal(err)
+	}
+	out, err = s.d.Cmd("pull", repoName)
+	c.Assert(err, check.IsNil, check.Commentf(out))
+	c.Assert(string(out), checker.Contains, "Tagging", check.Commentf(out))
+
+	s.d.CmdOrAssert("rmi", repoName)
+
+	// Try pull again with invalid notary server, should use cache
+	if err := s.restartDaemonWithServer("https://invalidnotaryserver"); err != nil {
+		c.Fatal(err)
+	}
+	out, err = s.d.Cmd("pull", repoName)
+	c.Assert(err, check.IsNil, check.Commentf(out))
+	c.Assert(string(out), checker.Contains, "Tagging", check.Commentf(out))
+}
