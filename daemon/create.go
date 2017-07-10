@@ -5,17 +5,24 @@ import (
 	"strings"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/containers/image/docker/daemon"
+	ciReference "github.com/containers/image/docker/reference"
+	ciImage "github.com/containers/image/image"
+	"github.com/containers/image/signature"
+	"github.com/containers/image/transports"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/errors"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/stringid"
+	"github.com/docker/docker/reference"
 	"github.com/docker/docker/runconfig"
 	volumestore "github.com/docker/docker/volume/store"
 	"github.com/docker/engine-api/types"
 	containertypes "github.com/docker/engine-api/types/container"
 	networktypes "github.com/docker/engine-api/types/network"
+	digest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/runc/libcontainer/label"
 )
 
@@ -75,6 +82,10 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 			return nil, err
 		}
 		imgID = img.ID()
+	}
+
+	if err := isRunningImageAllowed(params.Config.Image, imgID); err != nil {
+		return nil, err
 	}
 
 	if err := daemon.mergeAndVerifyConfig(params.Config, img); err != nil {
@@ -151,6 +162,100 @@ func (daemon *Daemon) create(params types.ContainerCreateConfig, managed bool) (
 	}
 	daemon.LogContainerEvent(container, "create")
 	return container, nil
+}
+
+var canonicalZeroBytesDigest = digest.Canonical.FromBytes([]byte{})
+
+// isRunningImageAllowed verifies whether the containers/image/signature.Policy
+// allows using image imgID with name refOrID.
+// Both imgID and refOrID may be "" if a container is being created without basing it on an image.
+func isRunningImageAllowed(refOrID string, imgID image.ID) error {
+	// configDigest may be the digest of a config created by docker on import of a schema1
+	// image; that’s fine, c/i/docker/daemon/extra will not find any data signatures, and
+	// a signedBy policy requirement will necessarily fail.
+	configDigest := digest.Digest(imgID)
+	if configDigest == "" {
+		// No parent image is used.  An empty byte array is not a valid config JSON,
+		// so this should not match any real image.
+		configDigest = canonicalZeroBytesDigest
+	}
+
+	if refOrID == "" {
+		// No parent image is used.  Pretend that the user specified an imageID
+		// corresponding to the nothing-matching configDigest selected above.
+		refOrID = canonicalZeroBytesDigest.String()
+	}
+	// NOTE:
+	// - This does not do reference.store.defaultRegistries expansion!
+	// - The lokup of imgID via Daemon.GetImage{,ID} also parses refRef as
+	//   $name:$imgIDPrefix, $imgIDPrefix, $algo:$imgIDPrefix.  We do nothing
+	//   about these formats.
+	//
+	// In both cases, we pass the users’ input straight to ciReference.ParseNormalizedNamed
+	// and pc.IsRunningImageAllowed; they either don’t care and accept everything,
+	// or match this against a signature, and ordinarily fail (unless the policy
+	// is intentionally flexible to allow them, using matchRepository and the like).
+	//
+	// That is, in the typical use, if signature verification is set up in the policy,
+	// containers can only be started if they refeer to images using the
+	// docker/distribution/reference-like name[:tag] and name@digest formats .
+	refID, refRef, err := reference.ParseIDOrReference(refOrID)
+	if err != nil {
+		return fmt.Errorf("Error parsing image ID/reference %s for policy enforcement: %v", refOrID, err)
+	}
+	// Exactly one of the two return values should be set.  This is currently always true;
+	// verify to protect against this changing, which would then cause daemon.NewReference
+	// to fail in a more surprising way.
+	if (refID != "") == (refRef != nil) {
+		return fmt.Errorf("Internal error parsing image ID/reference %s for policy enforcement: neither or both ID %#v and reference %#v returned", refOrID, refID, refRef)
+	}
+	var ciRef ciReference.Named
+	if refRef != nil {
+		// we can't use upstream docker/docker/reference since in projectatomic/docker
+		// we modified docker/docker/reference and it's not doing any normalization.
+		// we instead forked docker/docker/reference in containers/image and we need
+		// this parsing here to make sure signature naming checks are consistent.
+		r, err := ciReference.ParseNormalizedNamed(refRef.String())
+		if err != nil {
+			return fmt.Errorf("Internal error processsing image name %s for policy enforcement: %v", refRef.String(), err)
+		}
+		ciRef = r
+	}
+
+	defaultPolicy, err := signature.DefaultPolicy(nil)
+	if err != nil {
+		return fmt.Errorf("Error parsing signature verification policy: %v", err)
+	}
+	policyContext, err := signature.NewPolicyContext(defaultPolicy)
+	if err != nil {
+		return fmt.Errorf("Error preparing to verify signatures: %v", err)
+	}
+	defer policyContext.Destroy()
+
+	ref, err := daemon.NewReference(digest.Digest(refID), ciRef) // Code above ensures that exactly one of (refID, ciRef) is set.
+	if err != nil {
+		return fmt.Errorf("Error preparing a docker-daemon: image reference: %v", err)
+	}
+	rawSource, err := daemon.NewOriginalOnlyImageSource(nil, ref, configDigest)
+	if err != nil {
+		return fmt.Errorf("Error preparing a docker-daemon: image source: %v", err)
+	}
+	defer rawSource.Close()
+	unparsedOriginal := ciImage.UnparsedOriginalInstance(rawSource, nil)
+
+	logrus.Debugf("Checking whether running %s is allowed…", transports.ImageName(ref))
+	allowed, err := policyContext.IsRunningImageAllowed(unparsedOriginal)
+	if !allowed {
+		if err != nil {
+			return fmt.Errorf("Running %s isn't allowed: %v", transports.ImageName(ref), err)
+		}
+		return fmt.Errorf("Running %s isn't allowed", transports.ImageName(ref))
+	}
+	if err != nil {
+		return fmt.Errorf("Error evaluating policy for %s: %v", transports.ImageName(ref), err)
+	}
+	logrus.Debugf("… running allowed")
+	return nil
 }
 
 func (daemon *Daemon) generateSecurityOpt(hostConfig *containertypes.HostConfig) ([]string, error) {
