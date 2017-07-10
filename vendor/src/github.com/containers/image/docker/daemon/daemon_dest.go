@@ -3,13 +3,13 @@ package daemon
 import (
 	"io"
 
+	"github.com/Sirupsen/logrus"
 	"github.com/containers/image/docker/daemon/signatures"
 	"github.com/containers/image/docker/reference"
 	"github.com/containers/image/docker/tarfile"
 	"github.com/containers/image/types"
-	"github.com/docker/docker/client"
+	"github.com/docker/engine-api/client"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 

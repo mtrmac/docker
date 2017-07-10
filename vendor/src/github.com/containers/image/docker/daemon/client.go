@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 
 	"github.com/containers/image/types"
-	dockerclient "github.com/docker/docker/client"
+	dockerclient "github.com/docker/engine-api/client"
 	"github.com/docker/go-connections/tlsconfig"
 )
 
@@ -64,6 +64,5 @@ func tlsConfig(ctx *types.SystemContext) (*http.Client, error) {
 		Transport: &http.Transport{
 			TLSClientConfig: tlsc,
 		},
-		CheckRedirect: dockerclient.CheckRedirect,
 	}, nil
 }
