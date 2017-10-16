@@ -72,7 +72,7 @@ func (p *v2Puller) ciImage(c gctx.Context, ref reference.Named) (*ciImage.Unpars
 		DockerAuthConfig:            &dockerAuthConfig,
 		DockerRegistryUserAgent:     dockerversion.DockerUserAgent(c),
 	}
-	if p.config.RegistryService.SecureIndex(p.repoInfo.Index.Name) {
+	if isSecure {
 		ctx.DockerCertPath = filepath.Join(registry.CertsDir, p.repoInfo.Index.Name)
 	}
 	src, err := imgRef.NewImageSource(ctx)

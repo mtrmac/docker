@@ -32,7 +32,6 @@ type Service interface {
 	Search(ctx context.Context, term string, limit int, authConfigs map[string]types.AuthConfig, userAgent string, headers map[string][]string, noIndex bool) ([]registrytypes.SearchResultExt, error)
 	ServiceConfig() *registrytypes.ServiceConfig
 	TLSConfig(hostname string) (*tls.Config, error)
-	SecureIndex(hostname string) bool
 }
 
 // DefaultService is a registry service. It tracks configuration data such as a list
@@ -404,12 +403,6 @@ type APIEndpoint struct {
 // ToV1Endpoint returns a V1 API endpoint based on the APIEndpoint
 func (e APIEndpoint) ToV1Endpoint(userAgent string, metaHeaders http.Header) (*V1Endpoint, error) {
 	return newV1Endpoint(*e.URL, e.TLSConfig, userAgent, metaHeaders)
-}
-
-// SecureIndex returns true if the index is secure according to the config.
-// false otherwise.
-func (s *DefaultService) SecureIndex(hostname string) bool {
-	return isSecureIndex(s.config, hostname)
 }
 
 // TLSConfig constructs a client TLS configuration based on server defaults
